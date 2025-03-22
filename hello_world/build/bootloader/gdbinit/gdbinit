@@ -1,0 +1,2 @@
+source /home/laura/Documents/ESP32-GettingStarted/hello_world/build/bootloader/gdbinit/symbols
+source /home/laura/Documents/ESP32-GettingStarted/hello_world/build/bootloader/gdbinit/connect
