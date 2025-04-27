@@ -19,12 +19,14 @@
 #include "protocol_examples_common.h"
 #include "esp_tls_crypto.h"
 #include <esp_http_server.h>
+#include "driver/gpio.h"
 
 /* A simple example that demonstrates how to create GET and POST
  * handlers for the web server.
  */
 
 static const char *TAG = "example";
+#define LED_R GPIO_NUM_8
 
 #if CONFIG_EXAMPLE_BASIC_AUTH
 
@@ -145,12 +147,112 @@ static void httpd_register_basic_auth(httpd_handle_t server)
 }
 #endif
 
+/* This handler allows the custom error handling functionality to be
+ * tested from client side. For that, when a PUT request 0 is sent to
+ * URI /ctrl, the /hello and /echo URIs are unregistered and following
+ * custom error handler http_404_error_handler() is registered.
+ * Afterwards, when /hello or /echo is requested, this custom error
+ * handler is invoked which, after sending an error message to client,
+ * either closes the underlying socket (when requested URI is /echo)
+ * or keeps it open (when requested URI is /hello). This allows the
+ * client to infer if the custom error handler is functioning as expected
+ * by observing the socket state.
+ */
+esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    if (strcmp("/", req->uri) == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/ URI is not available");
+        /* Return ESP_OK to keep underlying socket open */
+        return ESP_OK;
+    } else if (strcmp("/hello", req->uri) == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/hello URI is not available");
+        /* Return ESP_OK to keep underlying socket open */
+        return ESP_OK;
+    } else if (strcmp("/echo", req->uri) == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/echo URI is not available");
+        /* Return ESP_FAIL to close underlying socket */
+        return ESP_FAIL;
+    } else if (strcmp("/ledon", req->uri) == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/echo URI is not available");
+        /* Return ESP_FAIL to close underlying socket */
+        return ESP_FAIL;
+    } else if (strcmp("/ledoff", req->uri) == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/echo URI is not available");
+        /* Return ESP_FAIL to close underlying socket */
+        return ESP_FAIL;
+    }
+
+    /* For any other URI send 404 and close socket */
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Some 404 error message");
+    return ESP_FAIL;
+}
+
+/* An HTTP POST handler */
+static esp_err_t echo_post_handler(httpd_req_t *req)
+{
+    char buf[100];
+    int ret, remaining = req->content_len;
+
+    while (remaining > 0) {
+        /* Read the data for the request */
+        if ((ret = httpd_req_recv(req, buf,
+                        MIN(remaining, sizeof(buf)))) <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                /* Retry receiving if timeout occurred */
+                continue;
+            }
+            return ESP_FAIL;
+        }
+
+        /* Send back the same data */
+        httpd_resp_send_chunk(req, buf, ret);
+        remaining -= ret;
+
+        /* Log data received */
+        ESP_LOGI(TAG, "=========== RECEIVED DATA ==========");
+        ESP_LOGI(TAG, "%.*s", ret, buf);
+        ESP_LOGI(TAG, "====================================");
+    }
+
+    // End response
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t ledoff_handler(httpd_req_t *req){
+    esp_err_t error;
+    ESP_LOGI(TAG, "LED turned OFF");
+    gpio_set_level(LED_R, 1);
+    const char *response =(const char*) req->user_ctx;
+    error = httpd_resp_send(req, response, strlen(response));
+    if(error != ESP_OK) {
+        ESP_LOGI(TAG, "Error %dwhile sending response", error);
+    } else {
+        ESP_LOGI(TAG, "Response sent successfullt");
+    }
+    return error;
+}
+
+static esp_err_t ledon_handler(httpd_req_t *req){
+    esp_err_t error;
+    ESP_LOGI(TAG, "LED turned ON");
+    gpio_set_level(LED_R, 0);
+    const char *response =(const char*) req->user_ctx;
+    error = httpd_resp_send(req, response, strlen(response));
+    if(error != ESP_OK) {
+        ESP_LOGI(TAG, "Error %dwhile sending response", error);
+    } else {
+        ESP_LOGI(TAG, "Response sent successfullt");
+    }
+    return error;
+}
+
 /* An HTTP GET handler */
 static esp_err_t hello_get_handler(httpd_req_t *req)
 {
     char*  buf;
     size_t buf_len;
-
+    
     /* Get header value string length and allocate memory for length + 1,
      * extra byte for null termination */
     buf_len = httpd_req_get_hdr_value_len(req, "Host") + 1;
@@ -209,8 +311,8 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
 
     /* Send response with custom headers and body set as the
      * string passed in user context*/
-    const char* resp_str = (const char*) req->user_ctx;
-    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    const char* resp_str = (const char*) req->user_ctx; 
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);    
 
     /* After sending the HTTP response the old HTTP request
      * headers are lost. Check if HTTP request headers can be read now. */
@@ -219,6 +321,15 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     }
     return ESP_OK;
 }
+
+static const httpd_uri_t root = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = hello_get_handler,
+    /* Let's pass response string in user
+     * context to demonstrate it's usage */
+    .user_ctx  = "Hello World!"
+};
 
 static const httpd_uri_t hello = {
     .uri       = "/hello",
@@ -229,37 +340,79 @@ static const httpd_uri_t hello = {
     .user_ctx  = "Hello World!"
 };
 
-/* An HTTP POST handler */
-static esp_err_t echo_post_handler(httpd_req_t *req)
-{
-    char buf[100];
-    int ret, remaining = req->content_len;
+static const httpd_uri_t ledoff = {
+    .uri       = "/ledoff",
+    .method    = HTTP_GET,
+    .handler   = ledoff_handler,
+    /* Let's pass response string in user
+     * context to demonstrate it's usage */
+    .user_ctx  = "<!DOCTYPE html>\
+<html>\
+<head>\
+<style>\
+.button {\
+  border: none;\
+  color: white;\
+  padding: 15px 32px;\
+  text-align: center;\
+  text-decoration: none;\
+  display: inline-block;\
+  font-size: 16px;\
+  margin: 4px 2px;\
+  cursor: pointer;\
+}\
+\
+.button1 {background-color: #04AA6D;}\
+</style>\
+</head>\
+<body>\
+\
+<h1>ESP32 WebServer</h1>\
+<p>Toggle on the board led</p>\
+<h3> LED STATUS: OFF </h3>\
+\
+<button class=\"button button1\" onclick=\"window.location.href='/ledon'\">LED ON</button>\
+\
+</body>\
+</html>"
+};
 
-    while (remaining > 0) {
-        /* Read the data for the request */
-        if ((ret = httpd_req_recv(req, buf,
-                        MIN(remaining, sizeof(buf)))) <= 0) {
-            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
-                /* Retry receiving if timeout occurred */
-                continue;
-            }
-            return ESP_FAIL;
-        }
-
-        /* Send back the same data */
-        httpd_resp_send_chunk(req, buf, ret);
-        remaining -= ret;
-
-        /* Log data received */
-        ESP_LOGI(TAG, "=========== RECEIVED DATA ==========");
-        ESP_LOGI(TAG, "%.*s", ret, buf);
-        ESP_LOGI(TAG, "====================================");
-    }
-
-    // End response
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
+static const httpd_uri_t ledon = {
+    .uri       = "/ledon",
+    .method    = HTTP_GET,
+    .handler   = ledon_handler,
+    /* Let's pass response string in user
+     * context to demonstrate it's usage */
+    .user_ctx  = "<!DOCTYPE html>\
+<html>\
+<head>\
+<style>\
+.button {\
+  border: none;\
+  color: white;\
+  padding: 15px 32px;\
+  text-align: center;\
+  text-decoration: none;\
+  display: inline-block;\
+  font-size: 16px;\
+  margin: 4px 2px;\
+  cursor: pointer;\
+}\
+\
+.button1 {background-color: #000000;}\
+</style>\
+</head>\
+<body>\
+\
+<h1>ESP32 WebServer</h1>\
+<p>Toggle on the board led</p>\
+<h3> LED STATUS: ON </h3>\
+\
+<button class=\"button button1\" onclick=\"window.location.href='/ledoff'\">LED OFF</button>\
+\
+</body>\
+</html>"
+};
 
 static const httpd_uri_t echo = {
     .uri       = "/echo",
@@ -267,33 +420,6 @@ static const httpd_uri_t echo = {
     .handler   = echo_post_handler,
     .user_ctx  = NULL
 };
-
-/* This handler allows the custom error handling functionality to be
- * tested from client side. For that, when a PUT request 0 is sent to
- * URI /ctrl, the /hello and /echo URIs are unregistered and following
- * custom error handler http_404_error_handler() is registered.
- * Afterwards, when /hello or /echo is requested, this custom error
- * handler is invoked which, after sending an error message to client,
- * either closes the underlying socket (when requested URI is /echo)
- * or keeps it open (when requested URI is /hello). This allows the
- * client to infer if the custom error handler is functioning as expected
- * by observing the socket state.
- */
-esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
-{
-    if (strcmp("/hello", req->uri) == 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/hello URI is not available");
-        /* Return ESP_OK to keep underlying socket open */
-        return ESP_OK;
-    } else if (strcmp("/echo", req->uri) == 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/echo URI is not available");
-        /* Return ESP_FAIL to close underlying socket */
-        return ESP_FAIL;
-    }
-    /* For any other URI send 404 and close socket */
-    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Some 404 error message");
-    return ESP_FAIL;
-}
 
 /* An HTTP PUT handler. This demonstrates realtime
  * registration and deregistration of URI handlers
@@ -349,9 +475,12 @@ static httpd_handle_t start_webserver(void)
     if (httpd_start(&server, &config) == ESP_OK) {
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
+        httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &hello);
         httpd_register_uri_handler(server, &echo);
         httpd_register_uri_handler(server, &ctrl);
+        httpd_register_uri_handler(server, &ledon);
+        httpd_register_uri_handler(server, &ledoff);
         #if CONFIG_EXAMPLE_BASIC_AUTH
         httpd_register_basic_auth(server);
         #endif
@@ -392,6 +521,13 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+static void configure_led(void)
+{
+    gpio_reset_pin(LED_R);
+    gpio_set_direction(LED_R, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_R, 1);
+
+}
 
 void app_main(void)
 {
@@ -414,11 +550,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
 #endif // CONFIG_EXAMPLE_CONNECT_WIFI
-#ifdef CONFIG_EXAMPLE_CONNECT_ETHERNET
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &connect_handler, &server));
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &disconnect_handler, &server));
-#endif // CONFIG_EXAMPLE_CONNECT_ETHERNET
 
+    configure_led();
     /* Start the server for the first time */
     server = start_webserver();
 }
